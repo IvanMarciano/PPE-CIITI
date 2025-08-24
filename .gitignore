@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+backend/.env
+
+# Node (por si sumás tooling)
+node_modules/
+
+# Arduino / PlatformIO
+.vscode/
+.pio/
+*.bin
+*.elf
+*.map
+
+# SO
+.DS_Store
+Thumbs.db

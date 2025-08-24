@@ -1,0 +1,27 @@
+<!doctype html><meta charset="utf-8">
+<h3>Test /analyze</h3>
+<form id="f">
+  <input type="file" id="img" accept="image/*" required>
+  <label>API URL: <input id="api" size="40" value="http://localhost:5000/analyze"></label><br>
+  <label><input type="checkbox" value="casco"   class="req"> Casco</label>
+  <label><input type="checkbox" value="chaleco" class="req"> Chaleco</label>
+  <label><input type="checkbox" value="gafas"   class="req"> Gafas</label>
+  <label><input type="checkbox" value="guantes" class="req"> Guantes</label>
+  <label><input type="checkbox" value="botas"   class="req"> Botas</label>
+  <label>min_conf <input id="min" type="number" step="0.05" value="0.6" min="0.5" max="0.95"></label>
+  <button>Enviar</button>
+</form>
+<pre id="out"></pre>
+<script>
+const $=s=>document.querySelector(s);
+$('#f').onsubmit=async e=>{
+  e.preventDefault();
+  const fd=new FormData();
+  fd.append('image',$('#img').files[0]);
+  const req=[...document.querySelectorAll('.req:checked')].map(i=>i.value);
+  fd.append('required', JSON.stringify(req));
+  fd.append('min_conf', $('#min').value);
+  const r=await fetch($('#api').value,{method:'POST',body:fd});
+  $('#out').textContent = await r.text();
+};
+</script>

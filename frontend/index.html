@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESP32‑CAM • EPP Inspector</title>
+  <style>
+    :root{
+      --bg:#0e1116; --card:#151a22; --muted:#212734; --text:#eaeef6; --sub:#9aa4b2; --accent:#3b82f6; --ok:#22c55e; --fail:#ef4444; --warn:#f59e0b;
+      --radius:16px; --shadow:0 8px 24px rgba(0,0,0,.25);
+    }
+    html,body{height:100%}
+    body{margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; background:linear-gradient(180deg,#0b0e13,#10151d 40%,#0b0f17); color:var(--text);}
+    .container{max-width:1100px; margin:0 auto; padding:20px;}
+    header{display:flex; gap:14px; align-items:center; justify-content:space-between; padding:14px 0 8px}
+    .title{display:flex; gap:12px; align-items:center}
+    .logo{width:42px; height:42px; border-radius:12px; background:conic-gradient(from 210deg, #3b82f6, #22c55e, #f59e0b, #3b82f6); box-shadow:0 0 40px rgba(59,130,246,.35) inset, 0 2px 8px rgba(0,0,0,.35)}
+    h1{font-size:20px; margin:0}
+
+    .toolbar{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+    .input{background:var(--card); border:1px solid var(--muted); color:var(--text); padding:10px 12px; border-radius:12px; min-width:260px}
+    .btn{appearance:none; border:0; border-radius:12px; padding:10px 14px; font-weight:600; cursor:pointer; background:var(--accent); color:white; box-shadow:var(--shadow);}
+    .btn:disabled{opacity:.6; cursor:not-allowed}
+    .btn.secondary{background:transparent; border:1px solid var(--muted); color:var(--text)}
+    .pill{font-size:12px; padding:6px 10px; border-radius:999px; background:var(--muted); color:var(--sub)}
+
+    .grid{display:grid; grid-template-columns: 1.1fr .9fr; gap:16px;}
+    @media (max-width: 900px){ .grid{grid-template-columns:1fr} }
+
+    .card{background:linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,0)); border:1px solid var(--muted); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden}
+    .card .hdr{display:flex; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--muted)}
+    .card .body{padding:16px}
+
+    .shot{background:#05070a; border:1px solid #0c1017; border-radius:12px; overflow:hidden; aspect-ratio:4/3; display:flex; align-items:center; justify-content:center}
+    .shot img{max-width:100%; max-height:100%}
+    .skeleton{width:100%; height:100%; background:repeating-linear-gradient(90deg, #0d121a 0 20px, #0f141d 20px 40px); animation:shimmer 2s linear infinite;}
+    @keyframes shimmer{from{background-position:0 0} to{background-position:100% 0}}
+
+    .actions{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px}
+
+    .list{display:grid; gap:10px}
+    .row{display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; background:rgba(255,255,255,.02); border:1px solid var(--muted); border-radius:12px}
+    .row .name{display:flex; align-items:center; gap:10px}
+    .chip{font-weight:700; font-size:13px; padding:6px 10px; border-radius:999px; border:1px solid var(--muted)}
+    .chip.ok{color:#04280f; background:linear-gradient(180deg,#5be089,#3ad970); border-color:#34d399}
+    .chip.fail{color:#3c0807; background:linear-gradient(180deg,#ffa5a1,#ff7b75); border-color:#ef4444}
+    .bar{height:10px; background:#0e1420; border:1px solid var(--muted); border-radius:999px; overflow:hidden; width:160px}
+    .bar>i{display:block; height:100%; width:0; background:linear-gradient(90deg,#ef4444,#f59e0b,#22c55e)}
+
+    .status{display:flex; gap:8px; align-items:center}
+    .status i{width:10px; height:10px; border-radius:50%; background:var(--warn)}
+    .status.ok i{background:var(--ok)}
+    .status.fail i{background:var(--fail)}
+
+    .json{background:#0b0f17; border:1px dashed var(--muted); border-radius:12px; padding:12px; max-height:220px; overflow:auto; color:#cbd5e1}
+
+    .toast{position:fixed; inset:auto 16px 16px auto; background:#111827; color:#e5e7eb; border:1px solid #374151; padding:10px 12px; border-radius:12px; box-shadow:var(--shadow); opacity:0; transform:translateY(10px); transition:.25s}
+    .toast.show{opacity:1; transform:none}
+
+    .spinner{position:fixed; inset:0; backdrop-filter:saturate(120%) blur(2px); background:rgba(2,6,12,.35); display:none; align-items:center; justify-content:center}
+    .spinner.show{display:flex}
+    .loader{width:46px; height:46px; border-radius:50%; border:4px solid rgba(255,255,255,.15); border-top-color:#7dd3fc; animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+
+    .foot{display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--sub); padding:16px 0}
+
+    .reqs{display:flex; flex-wrap:wrap; gap:10px; align-items:center}
+    .req{display:flex; align-items:center; gap:8px; padding:6px 10px; border:1px solid var(--muted); border-radius:999px; background:rgba(255,255,255,.02)}
+    .slider{display:flex; align-items:center; gap:10px; margin-top:10px}
+
+    .overall{display:flex; align-items:center; gap:10px; margin-top:10px}
+    .overall .chip{font-size:14px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="title">
+        <div class="logo"></div>
+        <div>
+          <h1>ESP32‑CAM • Inspector de EPP</h1>
+          <div class="pill" id="ip-pill">IP ESP32: —</div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <input id="api" class="input" placeholder="http://IP_PC:5000/analyze" />
+        <button class="btn secondary" id="saveApi">Guardar API</button>
+        <div class="status" id="status"><i></i><span>Listo</span></div>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Columna Izquierda: Captura -->
+      <section class="card">
+        <div class="hdr"><strong>Captura</strong><span class="pill" id="shotState">—</span></div>
+        <div class="body">
+          <div class="actions">
+            <button class="btn" id="btnShot">📷 Sacar foto</button>
+            <button class="btn" id="btnAnalyze" disabled>🔎 Analizar con IA</button>
+            <button class="btn secondary" id="btnClear">Limpiar</button>
+          </div>
+          <div class="shot" id="shotBox"><div class="skeleton" id="skeleton"></div><img id="shot" alt="captura" style="display:none"/></div>
+        </div>
+      </section>
+
+      <!-- Columna Derecha: Requisitos + Resultados -->
+      <section class="card">
+        <div class="hdr"><strong>Requisitos & Resultados</strong><span class="pill" id="aiState">—</span></div>
+        <div class="body">
+          <div>
+            <div style="font-weight:600; margin-bottom:6px">Requisitos del puesto</div>
+            <div class="reqs">
+              <label class="req"><input type="checkbox" id="req_casco"> Casco</label>
+              <label class="req"><input type="checkbox" id="req_chaleco"> Chaleco</label>
+              <label class="req"><input type="checkbox" id="req_gafas"> Gafas</label>
+              <label class="req"><input type="checkbox" id="req_guantes"> Guantes</label>
+              <label class="req"><input type="checkbox" id="req_botas"> Botas</label>
+            </div>
+            <div class="slider">
+              <span style="color:var(--sub)">Confianza mínima:</span>
+              <input type="range" id="minConf" min="0.5" max="0.95" step="0.05" value="0.6">
+              <span id="minConfLabel" class="pill">60%</span>
+              <button class="btn secondary" id="saveReqs">Guardar requisitos</button>
+            </div>
+          </div>
+
+          <div class="overall" id="overallBox" style="display:none">
+            <strong>Cumplimiento general:</strong>
+            <span id="overallChip" class="chip">—</span>
+            <span id="missing" style="color:var(--sub)"></span>
+          </div>
+
+          <div class="list" id="results" style="margin-top:12px"></div>
+          <div id="comments" style="margin-top:12px; color:var(--sub);"></div>
+          <details style="margin-top:12px">
+            <summary style="cursor:pointer">Ver JSON crudo</summary>
+            <pre class="json" id="rawJson">—</pre>
+          </details>
+        </div>
+      </section>
+    </div>
+
+    <div class="foot">
+      <div>Consejo: guardá la URL de tu API y los requisitos.</div>
+      <div>v1.1 • Requisitos + Cumplimiento</div>
+    </div>
+  </div>
+
+  <div class="spinner" id="spinner"><div class="loader"></div></div>
+  <div class="toast" id="toast">Mensaje</div>
+
+<script>
+(function(){
+  const $ = sel => document.querySelector(sel);
+  const apiInput = $('#api');
+  const saveApi = $('#saveApi');
+  const btnShot = $('#btnShot');
+  const btnAnalyze = $('#btnAnalyze');
+  const btnClear = $('#btnClear');
+  const shotImg = $('#shot');
+  const skeleton = $('#skeleton');
+  const shotState = $('#shotState');
+  const aiState = $('#aiState');
+  const results = $('#results');
+  const comments = $('#comments');
+  const rawJson = $('#rawJson');
+  const spinner = $('#spinner');
+  const toast = $('#toast');
+  const ipPill = $('#ip-pill');
+  const status = $('#status');
+
+  // Requisitos
+  const req = {
+    casco: $('#req_casco'), chaleco: $('#req_chaleco'), gafas: $('#req_gafas'), guantes: $('#req_guantes'), botas: $('#req_botas')
+  };
+  const minConf = $('#minConf');
+  const minConfLabel = $('#minConfLabel');
+  const saveReqs = $('#saveReqs');
+  const overallBox = $('#overallBox');
+  const overallChip = $('#overallChip');
+  const missingEl = $('#missing');
+
+  let lastBlob = null;
+
+  function setStatus(type, text){
+    status.classList.remove('ok','fail');
+    if(type) status.classList.add(type);
+    status.querySelector('span').textContent = text || 'Listo';
+  }
+  function showToast(msg){ toast.textContent = msg; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'), 2500); }
+  function setSpinner(on){ spinner.classList[on?'add':'remove']('show'); }
+  function setShotState(text){ shotState.textContent = text; }
+  function setAIState(text){ aiState.textContent = text; }
+  function setIpPill(){ ipPill.textContent = 'IP ESP32: ' + location.host; }
+  setIpPill();
+
+  // Persistencia API
+  const LS_KEY_API = 'epp_api_url';
+  const LS_KEY_REQS = 'epp_reqs';
+  apiInput.value = localStorage.getItem(LS_KEY_API) || 'http://<IP_DE_TU_PC>:5000/analyze';
+  saveApi.addEventListener('click', ()=>{ localStorage.setItem(LS_KEY_API, apiInput.value.trim()); showToast('API guardada'); });
+
+  // Persistencia Requisitos
+  function loadReqs(){
+    try{
+      const obj = JSON.parse(localStorage.getItem(LS_KEY_REQS) || '{}');
+      ['casco','chaleco','gafas','guantes','botas'].forEach(k=>{ if(typeof obj[k]==='boolean') req[k].checked = obj[k]; });
+      if(typeof obj.min_conf==='number') minConf.value = obj.min_conf.toFixed(2);
+    }catch(_){ /* noop */ }
+    updateMinConfLabel();
+  }
+  function saveReqsLS(){
+    const obj = {
+      casco: req.casco.checked, chaleco: req.chaleco.checked, gafas: req.gafas.checked, guantes: req.guantes.checked, botas: req.botas.checked,
+      min_conf: Number(minConf.value)
+    };
+    localStorage.setItem(LS_KEY_REQS, JSON.stringify(obj));
+  }
+  function updateMinConfLabel(){ minConfLabel.textContent = Math.round(Number(minConf.value)*100) + '%'; }
+  minConf.addEventListener('input', updateMinConfLabel);
+  saveReqs.addEventListener('click', ()=>{ saveReqsLS(); showToast('Requisitos guardados'); });
+  loadReqs();
+
+  function clearUI(){
+    lastBlob = null; shotImg.src = ''; shotImg.style.display='none'; skeleton.style.display='block';
+    results.innerHTML=''; comments.textContent=''; rawJson.textContent='—';
+    btnAnalyze.disabled = true; setShotState('—'); setAIState('—'); overallBox.style.display='none'; overallChip.textContent='—'; missingEl.textContent='';
+  }
+  $('#btnClear').addEventListener('click', clearUI);
+  clearUI();
+
+  function renderRow(label, present, conf){
+    const row = document.createElement('div'); row.className='row';
+    const name = document.createElement('div'); name.className='name'; name.innerHTML = `<strong>${label}</strong>`; row.appendChild(name);
+    const right = document.createElement('div'); right.style.display='flex'; right.style.alignItems='center'; right.style.gap='10px';
+    const chip = document.createElement('span'); chip.className = 'chip ' + (present? 'ok':'fail'); chip.textContent = present? 'OK':'NO';
+    const bar = document.createElement('div'); bar.className='bar'; const fill=document.createElement('i'); const pct=Math.max(0, Math.min(1, Number(conf||0)))*100; fill.style.width=pct+'%'; bar.appendChild(fill);
+    const pctTxt = document.createElement('span'); pctTxt.style.minWidth='42px'; pctTxt.style.textAlign='right'; pctTxt.style.color='var(--sub)'; pctTxt.textContent = (Number(conf||0)*100).toFixed(0)+'%';
+    right.appendChild(chip); right.appendChild(bar); right.appendChild(pctTxt);
+    row.appendChild(right); return row;
+  }
+
+  async function capture(){
+    setStatus('', 'Capturando…'); setShotState('Capturando…'); btnShot.disabled=true; btnAnalyze.disabled=true; setSpinner(true);
+    try{
+      const r = await fetch('/capture');
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const blob = await r.blob(); lastBlob = blob;
+      const url = URL.createObjectURL(blob);
+      skeleton.style.display='none'; shotImg.style.display='block'; shotImg.src = url;
+      setShotState('Foto tomada ✔'); setStatus('ok', 'Foto tomada'); btnAnalyze.disabled=false;
+    }catch(e){ setStatus('fail','Error capturando'); showToast(e.message); setShotState('Error'); }
+    finally{ btnShot.disabled=false; setSpinner(false); }
+  }
+
+  function getRequiredArray(){
+    const arr=[]; if(req.casco.checked) arr.push('casco'); if(req.chaleco.checked) arr.push('chaleco'); if(req.gafas.checked) arr.push('gafas'); if(req.guantes.checked) arr.push('guantes'); if(req.botas.checked) arr.push('botas'); return arr;
+  }
+
+  async function analyze(){
+    if(!lastBlob) return;
+    setAIState('Enviando a IA…'); setStatus('', 'Analizando…'); btnAnalyze.disabled=true; setSpinner(true);
+    try{
+      const fd = new FormData();
+      fd.append('image', lastBlob, 'capture.jpg');
+      fd.append('required', JSON.stringify(getRequiredArray()));
+      fd.append('min_conf', String(Number(minConf.value)));
+      const apiUrl = apiInput.value.trim(); if(!apiUrl) throw new Error('Configura la URL de la API');
+
+      const r = await fetch(apiUrl, { method:'POST', body: fd });
+      const json = await r.json(); rawJson.textContent = JSON.stringify(json, null, 2);
+
+      let data = json.result || {};
+      results.innerHTML='';
+      const items = [
+        {k:'casco', label:'Casco'},
+        {k:'chaleco', label:'Chaleco'},
+        {k:'gafas', label:'Gafas'},
+        {k:'guantes', label:'Guantes'},
+        {k:'botas', label:'Botas'}
+      ];
+      const summaryParts = [];
+      items.forEach(it=>{
+        const obj = data[it.k] || {}; const present = !!obj.present; const conf = Number(obj.confidence)||0;
+        results.appendChild(renderRow(it.label, present, conf));
+        summaryParts.push(`${it.label}:${present?'✔':'✘'}(${conf.toFixed(2)})`);
+      });
+      const comentario = (data.comentarios||'').toString();
+      comments.textContent = comentario ? 'Comentarios: '+ comentario : '';
+
+      // Cumplimiento general
+      const meets = !!data.meets_requirements;
+      overallBox.style.display='flex';
+      overallChip.className = 'chip ' + (meets? 'ok':'fail');
+      overallChip.textContent = meets? 'CUMPLE' : 'NO CUMPLE';
+      const miss = Array.isArray(data.missing_required)? data.missing_required: [];
+      missingEl.textContent = miss.length? ('Faltantes: ' + miss.join(', ')) : 'Todos los requisitos cubiertos';
+
+      // Enviar resumen al OLED
+      const summary = `REQ:${meets?'OK':'NO'} ${summaryParts.join(' ')}\nFaltan:${miss.join('|')}`.slice(0, 160);
+      try{ await fetch('/api_result', { method:'POST', headers:{'Content-Type':'text/plain'}, body: summary }); }catch(_){ }
+
+      setAIState('Análisis listo ✔'); setStatus('ok','Análisis listo');
+    }catch(e){ setStatus('fail','Error analizando'); setAIState('Error'); showToast(e.message); }
+    finally{ btnAnalyze.disabled=false; setSpinner(false); }
+  }
+
+  btnShot.addEventListener('click', capture);
+  btnAnalyze.addEventListener('click', analyze);
+})();
+</script>
+</body>
+</html>
