@@ -3,7 +3,14 @@ import os, json, sqlite3, datetime
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, send_from_directory, flash
 
-# ================== PATHS / APP ==================
+# ===== Cargar .env si existe =====
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ===== Paths / App =====
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 IMG_DIR  = DATA_DIR / "images"
@@ -11,9 +18,9 @@ DB_PATH  = DATA_DIR / "hub.db"
 os.makedirs(IMG_DIR, exist_ok=True)
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "checkSecret")  # ⚠️ poné un SECRET_KEY real en producción
+app.secret_key = os.getenv("SECRET_KEY", "dev-insecure-change-me")  # poné una real en prod
 
-# ================== DB HELPERS ===================
+# ===== DB helpers =====
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -41,7 +48,7 @@ def init_db():
             api_result_json TEXT,
             image_file TEXT
         )""")
-        # migración blanda por si falta force_rewrite
+        # migración blanda
         try:
             con.execute("ALTER TABLE employees ADD COLUMN force_rewrite INTEGER DEFAULT 0")
         except Exception:
@@ -49,7 +56,7 @@ def init_db():
 
 init_db()
 
-# ================== UI TEMPLATE ==================
+# ===== UI base =====
 TPL_BASE = """
 <!doctype html><html><head><meta charset="utf-8"/><title>{{title}}</title>
 <style>
@@ -61,8 +68,11 @@ table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #eee;pad
 .ok{color:#086a2e}.err{color:#a00000}
 input[type="text"]{padding:6px 8px;border:1px solid #ccc;border-radius:8px;width:100%}
 label.chk{display:inline-block;margin-right:12px}
-.row{display:flex;gap:16px}.col{flex:1}
+.row{display:flex;gap:16px;align-items:flex-start}.col{flex:1}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#fff4d6;color:#7a5b00;margin-left:8px}
+.kv{display:flex;gap:8px;flex-wrap:wrap}
+.kv span{background:#f6f6f6;border:1px solid #eee;border-radius:999px;padding:2px 8px}
+small.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:#666}
 </style></head><body>
 <header>
   <h2 style="flex:1">{{title}}</h2>
@@ -81,43 +91,30 @@ label.chk{display:inline-block;margin-right:12px}
 def render(body, **kw):
     return render_template_string(TPL_BASE, body=body, **kw)
 
-# ============== HELPERS EPP / PAYLOAD ============
-HUB_MIN_CONF = 0.6  # umbral para considerar "detectado" a partir del resultado de la API
-
-def desired_payload_from_employee(e):
-    desired_e = []
-    if e["casco"]:   desired_e.append("casco")
-    if e["lentes"]:  desired_e.append("lentes")
-    if e["guantes"]: desired_e.append("guantes")
-    return {"n": e["nombre"] or "", "e": desired_e, "fc": bool(e["epp_completo"]), "blk": bool(e["bloqueado"])}
-
+# ===== Helpers EPP =====
 HUB_MIN_CONF = 0.6
 
-def epp_required_from_employee_row(e):
-    """
-    Construye la lista de EPP requeridos a partir del registro de employees.
-    e puede ser None o sqlite3.Row.
-    """
-    if not e:
-        return []
-    # asegurar acceso tipo dict:
-    ed = dict(e) if not isinstance(e, dict) else e
+def row_to_dict(e):
+    return dict(e) if (e is not None and not isinstance(e, dict)) else (e or {})
 
+def desired_payload_from_employee(e_row):
+    ed = row_to_dict(e_row)
+    desired_e = []
+    if ed.get("casco"):   desired_e.append("casco")
+    if ed.get("lentes"):  desired_e.append("lentes")
+    if ed.get("guantes"): desired_e.append("guantes")
+    return {"n": ed.get("nombre") or "", "e": desired_e, "fc": bool(ed.get("epp_completo")), "blk": bool(ed.get("bloqueado"))}
+
+def epp_required_from_employee_row(e_row):
+    ed = row_to_dict(e_row)
     req = []
     if ed.get("casco"):   req.append("casco")
-    if ed.get("lentes"):  req.append("lentes")   # mapeamos lentes<->gafas para comparación
+    if ed.get("lentes"):  req.append("lentes")
     if ed.get("guantes"): req.append("guantes")
-    # Si querés que epp_completo implique todo, descomentá:
-    # if ed.get("epp_completo"):
-    #     req = ["casco","lentes","guantes","chaleco","botas"]
+    # if ed.get("epp_completo"): req = ["casco","lentes","guantes","chaleco","botas"]
     return req
 
-
 def epp_detected_from_api_result(api_result_json, min_conf=HUB_MIN_CONF):
-    """
-    Devuelve lista de EPP detectados con present==true y confidence>=min_conf.
-    Normaliza 'gafas' -> 'lentes' para comparar.
-    """
     have = []
     try:
         data = json.loads(api_result_json) if api_result_json else {}
@@ -143,12 +140,11 @@ def epp_detected_from_api_result(api_result_json, min_conf=HUB_MIN_CONF):
 def epp_list_to_str(epp_list):
     return ", ".join(epp_list) if epp_list else "-"
 
-# ===================== UI: DASHBOARD =====================
+# ===== Dashboard =====
 @app.get("/")
 def dashboard():
     with db() as con:
         rows = con.execute("SELECT * FROM records ORDER BY id DESC LIMIT 50").fetchall()
-    # cache de empleados por UID
     with db() as con:
         emps = {e["uid"]: e for e in con.execute("SELECT * FROM employees").fetchall()}
 
@@ -171,11 +167,8 @@ def dashboard():
         nombre = (e["nombre"] if e else "") or (r["nombre_tag"] or "")
         required = epp_required_from_employee_row(e)
         detected = epp_detected_from_api_result(r["api_result_json"], HUB_MIN_CONF)
-
-        # normalizar para comparar (gafas->lentes)
         def norm(xs): return sorted(set("lentes" if x == "gafas" else x for x in xs))
         pasa = set(norm(required)).issubset(set(norm(detected))) if required else False
-
         img = f'<img class="thumb" src="{url_for("image", name=r["image_file"])}"/>' if r["image_file"] else ""
         body += f"""
         <tr>
@@ -195,7 +188,135 @@ def dashboard():
 def image(name):
     return send_from_directory(IMG_DIR, name)
 
-# ===================== UI: EMPLEADOS =====================
+# ===== Integración Sueño (HC Gateway) =====
+import requests
+from datetime import datetime as _dt
+from datetime import timezone as _tz
+from datetime import timedelta as _td
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+HC_BASE = os.getenv("HC_BASE", "https://api.hcgateway.shuchir.dev")
+HC_USER = os.getenv("HC_USER")
+HC_PASS = os.getenv("HC_PASS")
+
+_hc_token = None
+_hc_expiry = None
+
+def _hc_login():
+    global _hc_token, _hc_expiry
+    if not HC_USER or not HC_PASS:
+        raise RuntimeError("Faltan HC_USER / HC_PASS en el entorno")
+    url = f"{HC_BASE}/api/v2/login"
+    r = requests.post(url, json={"username": HC_USER, "password": HC_PASS}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    _hc_token = data.get("token")
+    expiry_str = data.get("expiry")
+    _hc_expiry = None
+    if expiry_str:
+        try:
+            _hc_expiry = _dt.fromisoformat(expiry_str.replace("Z","+00:00"))
+        except Exception:
+            _hc_expiry = None
+    if not _hc_token:
+        raise RuntimeError("Login OK pero no vino 'token'")
+
+def _hc_get_token():
+    global _hc_token, _hc_expiry
+    if _hc_token and _hc_expiry:
+        if _dt.now(_tz.utc) + _td(seconds=60) < _hc_expiry:
+            return _hc_token
+    _hc_login()
+    return _hc_token
+
+SLEEP_STAGE_MAP = {0: "siesta/otro", 1: "despierto", 4: "ligero", 5: "profundo", 6: "REM"}
+
+def _dur_minutes(start_iso, end_iso):
+    try:
+        a = _dt.fromisoformat(start_iso.replace("Z","+00:00"))
+        b = _dt.fromisoformat(end_iso.replace("Z","+00:00"))
+        return int(max(0, (b - a).total_seconds() // 60))
+    except Exception:
+        return 0
+
+def _summarize_session(sess):
+    start = sess.get("start"); end = sess.get("end")
+    total = _dur_minutes(start, end)
+    per = {}
+    for st in (sess.get("data") or {}).get("stages", []):
+        s = st.get("stage")
+        mins = _dur_minutes(st.get("startTime"), st.get("endTime"))
+        name = SLEEP_STAGE_MAP.get(s, f"etapa_{s}")
+        per[name] = per.get(name, 0) + mins
+    return {"start": start, "end": end, "total_min": total, "per_stage": per}
+
+def _fmt_local(iso_str, fmt="%Y-%m-%d %H:%M"):
+    if not iso_str: return "-"
+    try:
+        dt = _dt.fromisoformat(iso_str.replace("Z","+00:00"))
+        tz = ZoneInfo("America/Argentina/Buenos_Aires") if ZoneInfo else None
+        return (dt.astimezone(tz) if tz else dt.astimezone()).strftime(fmt)
+    except Exception:
+        return iso_str
+
+def _local_midnight_range(days=7, include_today=False):
+    """Rango [inicio 00:00, fin 23:59:59] de los últimos 'days' días.
+       include_today=False -> termina AYER; True -> incluye HOY."""
+    tz = ZoneInfo("America/Argentina/Buenos_Aires") if ZoneInfo else _tz.utc
+    now_local = _dt.now(tz)
+    if include_today:
+        end_local = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+    else:
+        end_local = (now_local - _td(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+    start_local = (end_local - _td(days=days-1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local, end_local, tz
+
+def fetch_sleep_last_days(days=7, include_today=False):
+    """Dict por fecha local 'YYYY-MM-DD' -> {'total_min': X, 'per_stage': {...}}."""
+    start_local, end_local, tz = _local_midnight_range(days, include_today=include_today)
+    def to_utc(dt_local): return dt_local.astimezone(_tz.utc)
+    q = {
+        "start": {"$gte": to_utc(start_local).strftime("%Y-%m-%dT%H:%M:%SZ")},
+        "end":   {"$lte": to_utc(end_local).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    }
+    tok = _hc_get_token()
+    url = f"{HC_BASE}/api/v2/fetch/sleepSession"
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json={"queries": q}, timeout=30)
+    if r.status_code in (401,403):
+        _hc_login()
+        headers["Authorization"] = f"Bearer {_hc_token}"
+        r = requests.post(url, headers=headers, json={"queries": q}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    by_day = {}
+    for sess in data:
+        sm = _summarize_session(sess)
+        try:
+            st = _dt.fromisoformat(sm["start"].replace("Z","+00:00")).astimezone(tz)
+            dkey = st.strftime("%Y-%m-%d")
+        except Exception:
+            dkey = start_local.strftime("%Y-%m-%d")
+        day = by_day.setdefault(dkey, {"total_min": 0, "per_stage": {}})
+        day["total_min"] += sm["total_min"]
+        for k, v in sm["per_stage"].items():
+            day["per_stage"][k] = day["per_stage"].get(k, 0) + v
+
+    # completar días sin datos
+    out = {}
+    cur = start_local
+    while cur <= end_local:
+        k = cur.strftime("%Y-%m-%d")
+        out[k] = by_day.get(k, {"total_min": 0, "per_stage": {}})
+        cur += _td(days=1)
+
+    return dict(sorted(out.items(), key=lambda kv: kv[0]))
+
+# ===== Empleados =====
 @app.get("/empleados")
 def employees():
     with db() as con:
@@ -225,7 +346,8 @@ def employees():
 def edit_employee():
     uid = (request.args.get("uid") or "").strip()
     if not uid:
-        flash(("err","Falta UID")); return redirect(url_for("employees"))
+        flash(("err","Falta UID"))
+        return redirect(url_for("employees"))
     with db() as con:
         e = con.execute("SELECT * FROM employees WHERE uid=?", (uid,)).fetchone()
     nombre = e["nombre"] if e else ""
@@ -237,6 +359,36 @@ def edit_employee():
         "bloq": bool(e["bloqueado"]) if e else False,
         "force": bool(e["force_rewrite"]) if e else False
     }
+
+    # ---- Sueño: últimos 7 días (hasta AYER) ----
+    try:
+        series = fetch_sleep_last_days(days=7, include_today=False)
+        rows = ""
+        order = ["REM", "profundo", "ligero", "despierto", "siesta/otro"]
+        for day, agg in series.items():
+            per = agg["per_stage"]
+            chips = []
+            for k in order:
+                if k in per: chips.append(f"<span>{k}: {per[k]} min</span>")
+            for k, v in sorted(per.items()):
+                if k not in order: chips.append(f"<span>{k}: {v} min</span>")
+            chips_html = " ".join(chips) if chips else "<span>-</span>"
+            rows += f"<tr><td>{day}</td><td>{agg['total_min']}</td><td class='kv'>{chips_html}</td></tr>"
+        if not rows:
+            rows = "<tr><td colspan='3'>Sin datos en el período.</td></tr>"
+        sleep_html = f"""
+        <div class="card">
+          <h3>Sueño – Últimos 7 días</h3>
+          <table>
+            <tr><th>Fecha</th><th>Total (min)</th><th>Etapas (min)</th></tr>
+            {rows}
+          </table>
+        </div>
+        """
+    except Exception as ex:
+        sleep_html = f"<div class='card'><h3>Sueño – Últimos 7 días</h3><p class='err'>No se pudo obtener: {ex}</p></div>"
+
+    # ---- Form empleado ----
     body = """
     <div class="card"><h3>Editar/crear empleado</h3>
     <form action="%s" method="post">
@@ -266,6 +418,8 @@ def edit_employee():
         "checked" if flags["force"] else "",
         url_for("employees")
     )
+
+    body += sleep_html
     return render(body, title=f"Empleado {uid}")
 
 @app.post("/empleados/guardar")
@@ -279,7 +433,8 @@ def save_employee():
     bloq  = 1 if request.form.get("bloqueado") else 0
     force = 1 if request.form.get("force_rewrite") else 0
     if not uid:
-        flash(("err","UID requerido")); return redirect(url_for("employees"))
+        flash(("err","UID requerido"))
+        return redirect(url_for("employees"))
     now = datetime.datetime.now().isoformat(timespec="seconds")
     with db() as con:
         con.execute("""INSERT INTO employees(uid,nombre,casco,lentes,guantes,epp_completo,bloqueado,force_rewrite,updated_at)
@@ -293,16 +448,12 @@ def save_employee():
     flash(("ok","Empleado guardado"))
     return redirect(url_for("edit_employee", uid=uid))
 
-# ============== APIs para Raspberry / Integración ==============
+# ===== APIs para Raspberry =====
 @app.post("/should_rewrite")
 def should_rewrite():
-    """
-    Body: uid (form/json)
-    Devuelve: { ok, rewrite: bool, desired_payload?: {...} }
-    Lógica: si employees.force_rewrite == 1 => rewrite.
-    """
     uid = (request.form.get("uid") or (request.json.get("uid") if request.is_json else "") or "").strip()
-    if not uid: return jsonify({"ok": False, "error": "uid missing"}), 400
+    if not uid:
+        return jsonify({"ok": False, "error": "uid missing"}), 400
     with db() as con:
         e = con.execute("SELECT * FROM employees WHERE uid=?", (uid,)).fetchone()
     if not e:
@@ -313,12 +464,9 @@ def should_rewrite():
 
 @app.post("/rewrite_done")
 def rewrite_done():
-    """
-    Body: uid (form/json)
-    Efecto: pone force_rewrite=0 (limpia pendiente) y actualiza updated_at.
-    """
     uid = (request.form.get("uid") or (request.json.get("uid") if request.is_json else "") or "").strip()
-    if not uid: return jsonify({"ok": False, "error": "uid missing"}), 400
+    if not uid:
+        return jsonify({"ok": False, "error": "uid missing"}), 400
     now = datetime.datetime.now().isoformat(timespec="seconds")
     with db() as con:
         con.execute("UPDATE employees SET force_rewrite=0, updated_at=? WHERE uid=?", (now, uid))
@@ -326,17 +474,9 @@ def rewrite_done():
 
 @app.post("/ingreso")
 def ingreso():
-    """
-    Registra una fichada (imagen + resultado EPP) para el dashboard.
-    Form-data:
-      - image (archivo)
-      - uid (str)
-      - nombre_tag (str, opcional)
-      - epp_tag (JSON list, opcional)
-      - api_result (JSON str, opcional)
-    """
     f = request.files.get("image")
-    if not f: return jsonify({"ok": False, "error": "image missing"}), 400
+    if not f:
+        return jsonify({"ok": False, "error": "image missing"}), 400
     uid = (request.form.get("uid") or "").strip()
     nombre_tag = (request.form.get("nombre_tag") or "").strip()
     try:
@@ -355,7 +495,6 @@ def ingreso():
                     (ts, uid, nombre_tag, json.dumps(epp_tag,ensure_ascii=False), api_result, fname))
     return jsonify({"ok": True, "saved_image": fname})
 
-# ===================== MAIN ======================
+# ===== Main =====
 if __name__ == "__main__":
-    # corre en tu PC (front) en 0.0.0.0:8090
     app.run(host="0.0.0.0", port=8090, debug=False)
