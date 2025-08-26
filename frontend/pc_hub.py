@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+import os, json, sqlite3, datetime
+from pathlib import Path
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, send_from_directory, flash
+
+# ================== PATHS / APP ==================
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+IMG_DIR  = DATA_DIR / "images"
+DB_PATH  = DATA_DIR / "hub.db"
+os.makedirs(IMG_DIR, exist_ok=True)
+
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "checkSecret")  # ⚠️ poné un SECRET_KEY real en producción
+
+# ================== DB HELPERS ===================
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS employees(
+            uid TEXT PRIMARY KEY,
+            nombre TEXT,
+            casco INTEGER DEFAULT 0,
+            lentes INTEGER DEFAULT 0,
+            guantes INTEGER DEFAULT 0,
+            epp_completo INTEGER DEFAULT 0,
+            bloqueado INTEGER DEFAULT 0,
+            force_rewrite INTEGER DEFAULT 0,
+            updated_at TEXT
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS records(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT,
+            uid TEXT,
+            nombre_tag TEXT,
+            epp_tag_json TEXT,
+            api_result_json TEXT,
+            image_file TEXT
+        )""")
+        # migración blanda por si falta force_rewrite
+        try:
+            con.execute("ALTER TABLE employees ADD COLUMN force_rewrite INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+init_db()
+
+# ================== UI TEMPLATE ==================
+TPL_BASE = """
+<!doctype html><html><head><meta charset="utf-8"/><title>{{title}}</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial;max-width:1100px;margin:24px auto;padding:0 12px}
+header{display:flex;gap:12px;align-items:center}
+header a{padding:8px 12px;background:#eee;border-radius:8px;text-decoration:none;color:#333}
+table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #eee;padding:8px;text-align:left;vertical-align:top}
+.thumb{height:64px}.card{border:1px solid #eee;border-radius:12px;padding:16px;margin:16px 0}
+.ok{color:#086a2e}.err{color:#a00000}
+input[type="text"]{padding:6px 8px;border:1px solid #ccc;border-radius:8px;width:100%}
+label.chk{display:inline-block;margin-right:12px}
+.row{display:flex;gap:16px}.col{flex:1}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#fff4d6;color:#7a5b00;margin-left:8px}
+</style></head><body>
+<header>
+  <h2 style="flex:1">{{title}}</h2>
+  <nav>
+    <a href="{{url_for('dashboard')}}">Dashboard</a>
+    <a href="{{url_for('employees')}}">Empleados</a>
+  </nav>
+</header>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}<div class="card">{% for cat,msg in messages %}<div class="{{cat}}">{{msg}}</div>{% endfor %}</div>{% endif %}
+{% endwith %}
+{{ body|safe }}
+</body></html>
+"""
+
+def render(body, **kw):
+    return render_template_string(TPL_BASE, body=body, **kw)
+
+# ============== HELPERS EPP / PAYLOAD ============
+HUB_MIN_CONF = 0.6  # umbral para considerar "detectado" a partir del resultado de la API
+
+def desired_payload_from_employee(e):
+    desired_e = []
+    if e["casco"]:   desired_e.append("casco")
+    if e["lentes"]:  desired_e.append("lentes")
+    if e["guantes"]: desired_e.append("guantes")
+    return {"n": e["nombre"] or "", "e": desired_e, "fc": bool(e["epp_completo"]), "blk": bool(e["bloqueado"])}
+
+HUB_MIN_CONF = 0.6
+
+def epp_required_from_employee_row(e):
+    """
+    Construye la lista de EPP requeridos a partir del registro de employees.
+    e puede ser None o sqlite3.Row.
+    """
+    if not e:
+        return []
+    # asegurar acceso tipo dict:
+    ed = dict(e) if not isinstance(e, dict) else e
+
+    req = []
+    if ed.get("casco"):   req.append("casco")
+    if ed.get("lentes"):  req.append("lentes")   # mapeamos lentes<->gafas para comparación
+    if ed.get("guantes"): req.append("guantes")
+    # Si querés que epp_completo implique todo, descomentá:
+    # if ed.get("epp_completo"):
+    #     req = ["casco","lentes","guantes","chaleco","botas"]
+    return req
+
+
+def epp_detected_from_api_result(api_result_json, min_conf=HUB_MIN_CONF):
+    """
+    Devuelve lista de EPP detectados con present==true y confidence>=min_conf.
+    Normaliza 'gafas' -> 'lentes' para comparar.
+    """
+    have = []
+    try:
+        data = json.loads(api_result_json) if api_result_json else {}
+        if not (data.get("ok") and isinstance(data.get("result"), dict)):
+            return have
+        r = data["result"]
+        for k_api, k_std in [
+            ("casco", "casco"),
+            ("gafas", "lentes"),
+            ("lentes", "lentes"),
+            ("guantes", "guantes"),
+            ("chaleco", "chaleco"),
+            ("botas", "botas"),
+        ]:
+            slot = r.get(k_api)
+            if isinstance(slot, dict) and slot.get("present") and float(slot.get("confidence", 0)) >= min_conf:
+                if k_std not in have:
+                    have.append(k_std)
+    except Exception:
+        pass
+    return have
+
+def epp_list_to_str(epp_list):
+    return ", ".join(epp_list) if epp_list else "-"
+
+# ===================== UI: DASHBOARD =====================
+@app.get("/")
+def dashboard():
+    with db() as con:
+        rows = con.execute("SELECT * FROM records ORDER BY id DESC LIMIT 50").fetchall()
+    # cache de empleados por UID
+    with db() as con:
+        emps = {e["uid"]: e for e in con.execute("SELECT * FROM employees").fetchall()}
+
+    body = """
+    <div class="card"><h3>Últimas fichadas</h3>
+    <table>
+      <tr>
+        <th>Fecha</th>
+        <th>Foto</th>
+        <th>UID</th>
+        <th>Nombre</th>
+        <th>Protección requerida</th>
+        <th>Protección detectada</th>
+        <th>¿Pasa?</th>
+      </tr>
+    """
+    for r in rows:
+        uid = r["uid"] or ""
+        e = emps.get(uid)
+        nombre = (e["nombre"] if e else "") or (r["nombre_tag"] or "")
+        required = epp_required_from_employee_row(e)
+        detected = epp_detected_from_api_result(r["api_result_json"], HUB_MIN_CONF)
+
+        # normalizar para comparar (gafas->lentes)
+        def norm(xs): return sorted(set("lentes" if x == "gafas" else x for x in xs))
+        pasa = set(norm(required)).issubset(set(norm(detected))) if required else False
+
+        img = f'<img class="thumb" src="{url_for("image", name=r["image_file"])}"/>' if r["image_file"] else ""
+        body += f"""
+        <tr>
+          <td>{r['ts']}</td>
+          <td>{img}</td>
+          <td><a href="{url_for('edit_employee', uid=uid)}">{uid}</a></td>
+          <td>{nombre}</td>
+          <td>{epp_list_to_str(required)}</td>
+          <td>{epp_list_to_str(detected)}</td>
+          <td>{'✔️' if pasa else '❌'}</td>
+        </tr>
+        """
+    body += "</table></div>"
+    return render(body, title="Hub Fichador – Dashboard")
+
+@app.get("/images/<name>")
+def image(name):
+    return send_from_directory(IMG_DIR, name)
+
+# ===================== UI: EMPLEADOS =====================
+@app.get("/empleados")
+def employees():
+    with db() as con:
+        rows = con.execute("SELECT * FROM employees ORDER BY updated_at DESC NULLS LAST").fetchall()
+    body = """
+    <div class="card"><div class="row">
+      <div class="col"><h3>Empleados</h3></div>
+      <div><form action="%s" method="get">
+        <input type="text" name="uid" placeholder="UID nuevo/editar"/><button type="submit">Abrir</button>
+      </form></div></div>
+      <table><tr><th>UID</th><th>Nombre</th><th>EPP</th><th>Flags</th><th>Rewrite</th><th>Actualizado</th></tr>
+    """ % (url_for("edit_employee"))
+    for e in rows:
+        epps = []
+        if e["casco"]: epps.append("casco")
+        if e["lentes"]: epps.append("lentes")
+        if e["guantes"]: epps.append("guantes")
+        flags = []
+        if e["epp_completo"]: flags.append("EPP completo")
+        if e["bloqueado"]: flags.append("Bloqueado")
+        rw = "pendiente" if e["force_rewrite"] else "-"
+        body += f"<tr><td><a href='{url_for('edit_employee', uid=e['uid'])}'>{e['uid']}</a></td><td>{e['nombre'] or ''}</td><td>{', '.join(epps) if epps else '-'}</td><td>{', '.join(flags) if flags else '-'}</td><td>{rw}</td><td>{e['updated_at'] or ''}</td></tr>"
+    body += "</table></div>"
+    return render(body, title="Hub Fichador – Empleados")
+
+@app.get("/empleados/editar")
+def edit_employee():
+    uid = (request.args.get("uid") or "").strip()
+    if not uid:
+        flash(("err","Falta UID")); return redirect(url_for("employees"))
+    with db() as con:
+        e = con.execute("SELECT * FROM employees WHERE uid=?", (uid,)).fetchone()
+    nombre = e["nombre"] if e else ""
+    flags = {
+        "casco": bool(e["casco"]) if e else False,
+        "lentes": bool(e["lentes"]) if e else False,
+        "guantes": bool(e["guantes"]) if e else False,
+        "eppc": bool(e["epp_completo"]) if e else False,
+        "bloq": bool(e["bloqueado"]) if e else False,
+        "force": bool(e["force_rewrite"]) if e else False
+    }
+    body = """
+    <div class="card"><h3>Editar/crear empleado</h3>
+    <form action="%s" method="post">
+      <input type="hidden" name="uid" value="%s"/>
+      <p><b>UID:</b> %s %s</p>
+      <label>Nombre</label><input type="text" name="nombre" value="%s"/>
+      <p>EPP requerido:</p>
+      <label class="chk"><input type="checkbox" name="casco" %s> Casco</label>
+      <label class="chk"><input type="checkbox" name="lentes" %s> Lentes</label>
+      <label class="chk"><input type="checkbox" name="guantes" %s> Guantes</label>
+      <p>Flags:</p>
+      <label class="chk"><input type="checkbox" name="epp_completo" %s> EPP Completo</label>
+      <label class="chk"><input type="checkbox" name="bloqueado" %s> Personal Bloqueado</label>
+      <p>Reescritura:</p>
+      <label class="chk"><input type="checkbox" name="force_rewrite" %s> Forzar reescritura al próximo apoyo</label>
+      <div style="margin-top:12px"><button type="submit">Guardar</button> <a href="%s" style="margin-left:8px">Volver</a></div>
+    </form></div>
+    """ % (
+        url_for("save_employee"), uid,
+        uid, (f"<span class='badge'>rewrite pendiente</span>" if flags["force"] else ""),
+        nombre or "",
+        "checked" if flags["casco"] else "",
+        "checked" if flags["lentes"] else "",
+        "checked" if flags["guantes"] else "",
+        "checked" if flags["eppc"] else "",
+        "checked" if flags["bloq"] else "",
+        "checked" if flags["force"] else "",
+        url_for("employees")
+    )
+    return render(body, title=f"Empleado {uid}")
+
+@app.post("/empleados/guardar")
+def save_employee():
+    uid = (request.form.get("uid") or "").strip()
+    nombre = (request.form.get("nombre") or "").strip()
+    casco = 1 if request.form.get("casco") else 0
+    lentes = 1 if request.form.get("lentes") else 0
+    guantes = 1 if request.form.get("guantes") else 0
+    eppc = 1 if request.form.get("epp_completo") else 0
+    bloq  = 1 if request.form.get("bloqueado") else 0
+    force = 1 if request.form.get("force_rewrite") else 0
+    if not uid:
+        flash(("err","UID requerido")); return redirect(url_for("employees"))
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    with db() as con:
+        con.execute("""INSERT INTO employees(uid,nombre,casco,lentes,guantes,epp_completo,bloqueado,force_rewrite,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(uid) DO UPDATE SET
+                         nombre=excluded.nombre, casco=excluded.casco, lentes=excluded.lentes,
+                         guantes=excluded.guantes, epp_completo=excluded.epp_completo,
+                         bloqueado=excluded.bloqueado, force_rewrite=excluded.force_rewrite,
+                         updated_at=excluded.updated_at
+                    """, (uid,nombre,casco,lentes,guantes,eppc,bloq,force,now))
+    flash(("ok","Empleado guardado"))
+    return redirect(url_for("edit_employee", uid=uid))
+
+# ============== APIs para Raspberry / Integración ==============
+@app.post("/should_rewrite")
+def should_rewrite():
+    """
+    Body: uid (form/json)
+    Devuelve: { ok, rewrite: bool, desired_payload?: {...} }
+    Lógica: si employees.force_rewrite == 1 => rewrite.
+    """
+    uid = (request.form.get("uid") or (request.json.get("uid") if request.is_json else "") or "").strip()
+    if not uid: return jsonify({"ok": False, "error": "uid missing"}), 400
+    with db() as con:
+        e = con.execute("SELECT * FROM employees WHERE uid=?", (uid,)).fetchone()
+    if not e:
+        return jsonify({"ok": True, "rewrite": False})
+    if e["force_rewrite"]:
+        return jsonify({"ok": True, "rewrite": True, "desired_payload": desired_payload_from_employee(e)})
+    return jsonify({"ok": True, "rewrite": False})
+
+@app.post("/rewrite_done")
+def rewrite_done():
+    """
+    Body: uid (form/json)
+    Efecto: pone force_rewrite=0 (limpia pendiente) y actualiza updated_at.
+    """
+    uid = (request.form.get("uid") or (request.json.get("uid") if request.is_json else "") or "").strip()
+    if not uid: return jsonify({"ok": False, "error": "uid missing"}), 400
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    with db() as con:
+        con.execute("UPDATE employees SET force_rewrite=0, updated_at=? WHERE uid=?", (now, uid))
+    return jsonify({"ok": True})
+
+@app.post("/ingreso")
+def ingreso():
+    """
+    Registra una fichada (imagen + resultado EPP) para el dashboard.
+    Form-data:
+      - image (archivo)
+      - uid (str)
+      - nombre_tag (str, opcional)
+      - epp_tag (JSON list, opcional)
+      - api_result (JSON str, opcional)
+    """
+    f = request.files.get("image")
+    if not f: return jsonify({"ok": False, "error": "image missing"}), 400
+    uid = (request.form.get("uid") or "").strip()
+    nombre_tag = (request.form.get("nombre_tag") or "").strip()
+    try:
+        epp_tag = json.loads(request.form.get("epp_tag") or "[]")
+        if not isinstance(epp_tag, list): epp_tag = []
+    except Exception:
+        epp_tag = []
+    api_result = request.form.get("api_result") or ""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_uid = uid or "nouid"
+    fname = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_uid}.jpg"
+    f.save(IMG_DIR / fname)
+    with db() as con:
+        con.execute("""INSERT INTO records(ts,uid,nombre_tag,epp_tag_json,api_result_json,image_file)
+                       VALUES(?,?,?,?,?,?)""",
+                    (ts, uid, nombre_tag, json.dumps(epp_tag,ensure_ascii=False), api_result, fname))
+    return jsonify({"ok": True, "saved_image": fname})
+
+# ===================== MAIN ======================
+if __name__ == "__main__":
+    # corre en tu PC (front) en 0.0.0.0:8090
+    app.run(host="0.0.0.0", port=8090, debug=False)
