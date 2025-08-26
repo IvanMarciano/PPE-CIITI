@@ -114,6 +114,8 @@ def epp_required_from_employee_row(e_row):
     # if ed.get("epp_completo"): req = ["casco","lentes","guantes","chaleco","botas"]
     return req
 
+
+
 def epp_detected_from_api_result(api_result_json, min_conf=HUB_MIN_CONF):
     have = []
     try:
@@ -140,63 +142,18 @@ def epp_detected_from_api_result(api_result_json, min_conf=HUB_MIN_CONF):
 def epp_list_to_str(epp_list):
     return ", ".join(epp_list) if epp_list else "-"
 
-# ===== Dashboard =====
-@app.get("/")
-def dashboard():
-    with db() as con:
-        rows = con.execute("SELECT * FROM records ORDER BY id DESC LIMIT 50").fetchall()
-    with db() as con:
-        emps = {e["uid"]: e for e in con.execute("SELECT * FROM employees").fetchall()}
-
-    body = """
-    <div class="card"><h3>Últimas fichadas</h3>
-    <table>
-      <tr>
-        <th>Fecha</th>
-        <th>Foto</th>
-        <th>UID</th>
-        <th>Nombre</th>
-        <th>Protección requerida</th>
-        <th>Protección detectada</th>
-        <th>¿Pasa?</th>
-      </tr>
-    """
-    for r in rows:
-        uid = r["uid"] or ""
-        e = emps.get(uid)
-        nombre = (e["nombre"] if e else "") or (r["nombre_tag"] or "")
-        required = epp_required_from_employee_row(e)
-        detected = epp_detected_from_api_result(r["api_result_json"], HUB_MIN_CONF)
-        def norm(xs): return sorted(set("lentes" if x == "gafas" else x for x in xs))
-        pasa = set(norm(required)).issubset(set(norm(detected))) if required else False
-        img = f'<img class="thumb" src="{url_for("image", name=r["image_file"])}"/>' if r["image_file"] else ""
-        body += f"""
-        <tr>
-          <td>{r['ts']}</td>
-          <td>{img}</td>
-          <td><a href="{url_for('edit_employee', uid=uid)}">{uid}</a></td>
-          <td>{nombre}</td>
-          <td>{epp_list_to_str(required)}</td>
-          <td>{epp_list_to_str(detected)}</td>
-          <td>{'✔️' if pasa else '❌'}</td>
-        </tr>
-        """
-    body += "</table></div>"
-    return render(body, title="Hub Fichador – Dashboard")
-
-@app.get("/images/<name>")
-def image(name):
-    return send_from_directory(IMG_DIR, name)
-
 # ===== Integración Sueño (HC Gateway) =====
 import requests
 from datetime import datetime as _dt
-from datetime import timezone as _tz
+from datetime import timezone as _timezone
 from datetime import timedelta as _td
+
+# TZ consistente (aware). Fallback a UTC-3 si no está zoneinfo.
 try:
     from zoneinfo import ZoneInfo
+    BA_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 except Exception:
-    ZoneInfo = None
+    BA_TZ = _timezone(_td(hours=-3))
 
 HC_BASE = os.getenv("HC_BASE", "https://api.hcgateway.shuchir.dev")
 HC_USER = os.getenv("HC_USER")
@@ -205,39 +162,112 @@ HC_PASS = os.getenv("HC_PASS")
 _hc_token = None
 _hc_expiry = None
 
+def _mins_to_hm(m):
+    try:
+        m = int(m or 0)
+    except Exception:
+        m = 0
+    h = m // 60
+    mm = m % 60
+    if h and mm:
+        return f"{h} h {mm} min"
+    if h and not mm:
+        return f"{h} h"
+    return f"{mm} min"
+
+def _accumulate_stage_minutes_per_day(by_day, start_iso, end_iso, stage, tz, win_start_local, win_end_local):
+    """
+    Toma una etapa (start_iso/end_iso, UTC) y la parte por días locales [00:00–24:00),
+    acumulando minutos por día en by_day[YYYY-MM-DD]. Respeta la ventana [win_start_local, win_end_local].
+    """
+    try:
+        s_utc = _dt.fromisoformat(start_iso.replace("Z", "+00:00"))
+        e_utc = _dt.fromisoformat(end_iso.replace("Z", "+00:00"))
+    except Exception:
+        return
+
+    if e_utc <= s_utc:
+        return
+
+    # Pasar a horario local (BA)
+    s_loc = s_utc.astimezone(tz)
+    e_loc = e_utc.astimezone(tz)
+
+    # Recortar a la ventana pedida
+    if s_loc < win_start_local:
+        s_loc = win_start_local
+    if e_loc > win_end_local:
+        e_loc = win_end_local
+    if e_loc <= s_loc:
+        return
+
+    label = SLEEP_STAGE_MAP.get(stage, f"etapa_{stage}")
+
+    cur = s_loc
+    while cur < e_loc:
+        # próximo medianoche local
+        next_midnight = (cur + _td(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seg_end = e_loc if e_loc < next_midnight else next_midnight
+        minutes = int((seg_end - cur).total_seconds() // 60)
+        if minutes > 0:
+            dkey = cur.strftime("%Y-%m-%d")
+            day = by_day.setdefault(dkey, {"total_min": 0, "per_stage": {}})
+            day["total_min"] += minutes
+            day["per_stage"][label] = day["per_stage"].get(label, 0) + minutes
+        cur = seg_end
+
+
+def _parse_iso_aware_utc(iso_s: str):
+    """Devuelve un datetime *aware UTC* a partir de un ISO posible sin tz."""
+    try:
+        dt = _dt.fromisoformat(iso_s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    # Si viene naive (sin tz), asumimos UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_timezone.utc)
+    else:
+        dt = dt.astimezone(_timezone.utc)
+    return dt
+
+
 def _hc_login():
     global _hc_token, _hc_expiry
     if not HC_USER or not HC_PASS:
         raise RuntimeError("Faltan HC_USER / HC_PASS en el entorno")
     url = f"{HC_BASE}/api/v2/login"
-    r = requests.post(url, json={"username": HC_USER, "password": HC_PASS}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        r = requests.post(url, json={"username": HC_USER, "password": HC_PASS}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as ex:
+        raise RuntimeError(f"Fallo login HC: {ex}")
+
     _hc_token = data.get("token")
     expiry_str = data.get("expiry")
-    _hc_expiry = None
-    if expiry_str:
-        try:
-            _hc_expiry = _dt.fromisoformat(expiry_str.replace("Z","+00:00"))
-        except Exception:
-            _hc_expiry = None
+    _hc_expiry = _parse_iso_aware_utc(expiry_str) if expiry_str else None
+
     if not _hc_token:
         raise RuntimeError("Login OK pero no vino 'token'")
 
 def _hc_get_token():
     global _hc_token, _hc_expiry
     if _hc_token and _hc_expiry:
-        if _dt.now(_tz.utc) + _td(seconds=60) < _hc_expiry:
+        now_utc = _dt.now(_timezone.utc)
+        # _hc_expiry ya es aware UTC, pero por las dudas:
+        exp_utc = _hc_expiry.astimezone(_timezone.utc) if _hc_expiry.tzinfo else _hc_expiry.replace(tzinfo=_timezone.utc)
+        if now_utc + _td(seconds=60) < exp_utc:
             return _hc_token
     _hc_login()
     return _hc_token
+
 
 SLEEP_STAGE_MAP = {0: "siesta/otro", 1: "despierto", 4: "ligero", 5: "profundo", 6: "REM"}
 
 def _dur_minutes(start_iso, end_iso):
     try:
-        a = _dt.fromisoformat(start_iso.replace("Z","+00:00"))
-        b = _dt.fromisoformat(end_iso.replace("Z","+00:00"))
+        a = _dt.fromisoformat(start_iso.replace("Z","+00:00"))  # aware UTC
+        b = _dt.fromisoformat(end_iso.replace("Z","+00:00"))    # aware UTC
         return int(max(0, (b - a).total_seconds() // 60))
     except Exception:
         return 0
@@ -256,32 +286,82 @@ def _summarize_session(sess):
 def _fmt_local(iso_str, fmt="%Y-%m-%d %H:%M"):
     if not iso_str: return "-"
     try:
-        dt = _dt.fromisoformat(iso_str.replace("Z","+00:00"))
-        tz = ZoneInfo("America/Argentina/Buenos_Aires") if ZoneInfo else None
-        return (dt.astimezone(tz) if tz else dt.astimezone()).strftime(fmt)
+        dt = _dt.fromisoformat(iso_str.replace("Z","+00:00"))  # aware UTC
+        return dt.astimezone(BA_TZ).strftime(fmt)
     except Exception:
         return iso_str
 
 def _local_midnight_range(days=7, include_today=False):
     """Rango [inicio 00:00, fin 23:59:59] de los últimos 'days' días.
        include_today=False -> termina AYER; True -> incluye HOY."""
-    tz = ZoneInfo("America/Argentina/Buenos_Aires") if ZoneInfo else _tz.utc
-    now_local = _dt.now(tz)
+    now_local = _dt.now(BA_TZ)  # aware en BA
     if include_today:
         end_local = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
     else:
         end_local = (now_local - _td(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
     start_local = (end_local - _td(days=days-1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return start_local, end_local, tz
+    return start_local, end_local, BA_TZ
 
 def fetch_sleep_last_days(days=7, include_today=False):
     """Dict por fecha local 'YYYY-MM-DD' -> {'total_min': X, 'per_stage': {...}}."""
     start_local, end_local, tz = _local_midnight_range(days, include_today=include_today)
-    def to_utc(dt_local): return dt_local.astimezone(_tz.utc)
+
+    def to_utc(dt_local): return dt_local.astimezone(_timezone.utc)
     q = {
         "start": {"$gte": to_utc(start_local).strftime("%Y-%m-%dT%H:%M:%SZ")},
         "end":   {"$lte": to_utc(end_local).strftime("%Y-%m-%dT%H:%M:%SZ")}
     }
+
+    tok = _hc_get_token()
+    url = f"{HC_BASE}/api/v2/fetch/sleepSession"
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json={"queries": q}, timeout=30)
+    if r.status_code in (401, 403):
+        _hc_login()
+        headers["Authorization"] = f"Bearer {_hc_token}"
+        r = requests.post(url, headers=headers, json={"queries": q}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    by_day = {}
+    # Partimos CADA ETAPA por días y acumulamos
+    for sess in data:
+        stages = ((sess.get("data") or {}).get("stages") or [])
+        for st in stages:
+            s = st.get("startTime"); e = st.get("endTime"); stage = st.get("stage")
+            if not (s and e) or stage is None:
+                continue
+            _accumulate_stage_minutes_per_day(by_day, s, e, stage, tz, start_local, end_local)
+
+    # Completar días sin datos dentro de la ventana
+    out = {}
+    cur = start_local
+    while cur <= end_local:
+        k = cur.strftime("%Y-%m-%d")
+        out[k] = by_day.get(k, {"total_min": 0, "per_stage": {}})
+        cur += _td(days=1)
+
+    # Orden descendente (más reciente → más lejano)
+    return dict(sorted(out.items(), key=lambda kv: kv[0], reverse=True))
+
+
+def fetch_sleep_for_dates(date_keys):
+    """Obtiene agregados de sueño solo para las fechas locales dadas (YYYY-MM-DD)."""
+    if not date_keys:
+        return {}
+    # Rango mínimo que cubre las fechas pedidas (aware BA)
+    min_k = min(date_keys)
+    max_k = max(date_keys)
+
+    start_local = _dt.strptime(min_k + " 00:00:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=BA_TZ)
+    end_local   = _dt.strptime(max_k + " 23:59:59", "%Y-%m-%d %H:%M:%S").replace(tzinfo=BA_TZ)
+
+    def to_utc(dt_local): return dt_local.astimezone(_timezone.utc)
+    q = {
+        "start": {"$gte": to_utc(start_local).strftime("%Y-%m-%dT%H:%M:%SZ")},
+        "end":   {"$lte": to_utc(end_local).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    }
+
     tok = _hc_get_token()
     url = f"{HC_BASE}/api/v2/fetch/sleepSession"
     headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
@@ -293,28 +373,96 @@ def fetch_sleep_last_days(days=7, include_today=False):
     r.raise_for_status()
     data = r.json()
 
+    # agrego por día local BA
     by_day = {}
     for sess in data:
         sm = _summarize_session(sess)
         try:
-            st = _dt.fromisoformat(sm["start"].replace("Z","+00:00")).astimezone(tz)
+            st = _dt.fromisoformat(sm["start"].replace("Z","+00:00")).astimezone(BA_TZ)
             dkey = st.strftime("%Y-%m-%d")
         except Exception:
-            dkey = start_local.strftime("%Y-%m-%d")
+            continue
         day = by_day.setdefault(dkey, {"total_min": 0, "per_stage": {}})
         day["total_min"] += sm["total_min"]
         for k, v in sm["per_stage"].items():
             day["per_stage"][k] = day["per_stage"].get(k, 0) + v
 
-    # completar días sin datos
+    # solo las fechas pedidas; si falta alguna, total 0
     out = {}
-    cur = start_local
-    while cur <= end_local:
-        k = cur.strftime("%Y-%m-%d")
+    for k in date_keys:
         out[k] = by_day.get(k, {"total_min": 0, "per_stage": {}})
-        cur += _td(days=1)
+    return out
 
-    return dict(sorted(out.items(), key=lambda kv: kv[0]))
+def _local_day_from_ts(ts_str):
+    """Devuelve YYYY-MM-DD (BA) a partir de ts 'YYYY-MM-DD HH:MM:SS'."""
+    try:
+        dt_naive = _dt.strptime(ts_str, "%Y-%m-%d %H:%M:%S")  # lo guardaste en local sin tz
+        dt = dt_naive.replace(tzinfo=BA_TZ)  # volverlo aware en BA
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ts_str.split(" ",1)[0] if ts_str else ""
+
+# ===== Dashboard =====
+@app.get("/")
+def dashboard():
+    with db() as con:
+        rows = con.execute("SELECT * FROM records ORDER BY id DESC LIMIT 50").fetchall()
+    with db() as con:
+        emps = {e["uid"]: e for e in con.execute("SELECT * FROM employees").fetchall()}
+
+    # --- Precalcular sueño por día para las fechas de las fichadas ---
+    days_needed = set()
+    for r in rows:
+        if r["ts"]:
+            days_needed.add(_local_day_from_ts(r["ts"]))
+    sleep_by_day = fetch_sleep_for_dates(days_needed) if days_needed else {}
+
+    body = """
+    <div class="card"><h3>Últimas fichadas</h3>
+    <table>
+      <tr>
+        <th>Fecha/Hora</th>
+        <th>Día (local)</th>
+        <th>Foto</th>
+        <th>UID</th>
+        <th>Nombre</th>
+        <th>Protección requerida</th>
+        <th>Protección detectada</th>
+        <th>Sueño del día</th>
+        <th>¿Pasa?</th>
+      </tr>
+    """
+    for r in rows:
+        uid = r["uid"] or ""
+        e = emps.get(uid)
+        nombre = (e["nombre"] if e else "") or (r["nombre_tag"] or "")
+        required = epp_required_from_employee_row(e)
+        detected = epp_detected_from_api_result(r["api_result_json"], HUB_MIN_CONF)
+        def norm(xs): return sorted(set("lentes" if x == "gafas" else x for x in xs))
+        pasa = set(norm(required)).issubset(set(norm(detected))) if required else False
+        img = f'<img class="thumb" src="{url_for("image", name=r["image_file"])}"/>' if r["image_file"] else ""
+        dkey = _local_day_from_ts(r["ts"] or "")
+        sleep_total_min = (sleep_by_day.get(dkey, {}) or {}).get("total_min", 0)
+        sleep_total_hm = _mins_to_hm(sleep_total_min)
+        body += f"""
+        <tr>
+          <td>{r['ts']}</td>
+          <td>{dkey}</td>
+          <td>{img}</td>
+          <td><a href="{url_for('edit_employee', uid=uid)}">{uid}</a></td>
+          <td>{nombre}</td>
+          <td>{epp_list_to_str(required)}</td>
+          <td>{epp_list_to_str(detected)}</td>
+          <td>{sleep_total_hm}</td>
+          <td>{'✔️' if pasa else '❌'}</td>
+        </tr>
+        """
+    body += "</table></div>"
+    return render(body, title="Hub Fichador – Dashboard")
+
+@app.get("/images/<name>")
+def image(name):
+    return send_from_directory(IMG_DIR, name)
 
 # ===== Empleados =====
 @app.get("/empleados")
@@ -360,27 +508,28 @@ def edit_employee():
         "force": bool(e["force_rewrite"]) if e else False
     }
 
-    # ---- Sueño: últimos 7 días (hasta AYER) ----
+    # ---- Sueño: últimos 7 días (INCLUYENDO HOY), orden descendente ----
     try:
-        series = fetch_sleep_last_days(days=7, include_today=False)
+        series = fetch_sleep_last_days(days=7, include_today=True)
         rows = ""
         order = ["REM", "profundo", "ligero", "despierto", "siesta/otro"]
-        for day, agg in series.items():
+        for day, agg in series.items():  # ya viene ordenado desc
             per = agg["per_stage"]
             chips = []
             for k in order:
-                if k in per: chips.append(f"<span>{k}: {per[k]} min</span>")
+                if k in per: chips.append(f"<span>{k}: {_mins_to_hm(per[k])}</span>")
             for k, v in sorted(per.items()):
-                if k not in order: chips.append(f"<span>{k}: {v} min</span>")
+                if k not in order: chips.append(f"<span>{k}: {_mins_to_hm(v)}</span>")
             chips_html = " ".join(chips) if chips else "<span>-</span>"
-            rows += f"<tr><td>{day}</td><td>{agg['total_min']}</td><td class='kv'>{chips_html}</td></tr>"
+            total_hm = _mins_to_hm(agg.get('total_min', 0))
+            rows += f"<tr><td>{day}</td><td>{total_hm}</td><td class='kv'>{chips_html}</td></tr>"
         if not rows:
             rows = "<tr><td colspan='3'>Sin datos en el período.</td></tr>"
         sleep_html = f"""
         <div class="card">
-          <h3>Sueño – Últimos 7 días</h3>
+          <h3>Sueño – Últimos 7 días (incluye hoy)</h3>
           <table>
-            <tr><th>Fecha</th><th>Total (min)</th><th>Etapas (min)</th></tr>
+            <tr><th>Fecha</th><th>Total</th><th>Etapas</th></tr>
             {rows}
           </table>
         </div>
